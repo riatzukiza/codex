@@ -1,86 +1,26 @@
-# deps
-# Node.js dependencies
-node_modules
-.pnpm-store
-.pnpm-debug.log
-
-# Keep pnpm-lock.yaml
-!pnpm-lock.yaml
-
-# build
+# Build artifacts
 dist/
 build/
-out/
-storybook-static/
-
-# ignore README for publishing
-codex-cli/README.md
-
-# ignore Nix derivation results
-result
-
-# editor
-.vscode/
-.idea/
-.history/
-.zed/
-*.swp
-*~
-
-# cli tools
-CLAUDE.md
-.claude/
-AGENTS.override.md
-
-# caches
-.cache/
-.turbo/
-.parcel-cache/
-.eslintcache
-.nyc_output/
-.jest/
+lib/
 *.tsbuildinfo
 
-# logs
+# Dependencies 
+node_modules/
 *.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
+*.pid
+*.seed
+*.pid.lock
 
-# env
-.env*
-!.env.example
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
 
-# package
-*.tgz
-
-# ci
-.vercel/
-.netlify/
-
-# patches
-apply_patch/
-
-# coverage
-coverage/
-
-# os
-.DS_Store
-Thumbs.db
-Icon?
-.Spotlight-V100/
-
-# Unwanted package managers
-.yarn/
-yarn.lock
-
-# release
-package.json-e
-session.ts-e
-CHANGELOG.ignore.md
-
-# nix related
-.direnv
-.envrc
-
-.nx/
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
