@@ -1,25 +1,16 @@
-mod cloud_requirements;
-mod config_requirements;
-mod diagnostics;
-mod fingerprint;
 mod layer_io;
 #[cfg(target_os = "macos")]
 mod macos;
-mod merge;
-mod overrides;
-mod requirements_exec_policy;
-mod state;
 
 #[cfg(test)]
 mod tests;
 
-use crate::config::CONFIG_TOML_FILE;
 use crate::config::ConfigToml;
-use crate::config::deserialize_config_toml_with_base;
-use crate::config_loader::config_requirements::ConfigRequirementsWithSources;
 use crate::config_loader::layer_io::LoadedConfigLayers;
-use crate::git_info::resolve_root_git_project_for_trust;
 use codex_app_server_protocol::ConfigLayerSource;
+use codex_config::CONFIG_TOML_FILE;
+use codex_config::ConfigRequirementsWithSources;
+use codex_git_utils::resolve_root_git_project_for_trust;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::protocol::AskForApproval;
@@ -29,47 +20,69 @@ use dunce::canonicalize as normalize_path;
 use serde::Deserialize;
 use std::io;
 use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
 use toml::Value as TomlValue;
 
-pub use cloud_requirements::CloudRequirementsLoader;
-pub use config_requirements::ConfigRequirements;
-pub use config_requirements::ConfigRequirementsToml;
-pub use config_requirements::ConstrainedWithSource;
-pub use config_requirements::McpServerIdentity;
-pub use config_requirements::McpServerRequirement;
-pub use config_requirements::NetworkConstraints;
-pub use config_requirements::NetworkRequirementsToml;
-pub use config_requirements::RequirementSource;
-pub use config_requirements::ResidencyRequirement;
-pub use config_requirements::SandboxModeRequirement;
-pub use config_requirements::Sourced;
-pub use config_requirements::WebSearchModeRequirement;
-pub use diagnostics::ConfigError;
-pub use diagnostics::ConfigLoadError;
-pub use diagnostics::TextPosition;
-pub use diagnostics::TextRange;
-pub(crate) use diagnostics::config_error_from_toml;
-pub(crate) use diagnostics::first_layer_config_error;
-pub(crate) use diagnostics::first_layer_config_error_from_entries;
-pub use diagnostics::format_config_error;
-pub use diagnostics::format_config_error_with_source;
-pub(crate) use diagnostics::io_error_from_config_error;
-pub use merge::merge_toml_values;
-pub(crate) use overrides::build_cli_overrides_layer;
-pub use state::ConfigLayerEntry;
-pub use state::ConfigLayerStack;
-pub use state::ConfigLayerStackOrdering;
-pub use state::LoaderOverrides;
-
-/// On Unix systems, load requirements from this file path, if present.
-const DEFAULT_REQUIREMENTS_TOML_FILE_UNIX: &str = "/etc/codex/requirements.toml";
+pub use codex_config::AppRequirementToml;
+pub use codex_config::AppsRequirementsToml;
+pub use codex_config::CloudRequirementsLoadError;
+pub use codex_config::CloudRequirementsLoadErrorCode;
+pub use codex_config::CloudRequirementsLoader;
+pub use codex_config::ConfigError;
+pub use codex_config::ConfigLayerEntry;
+pub use codex_config::ConfigLayerStack;
+pub use codex_config::ConfigLayerStackOrdering;
+pub use codex_config::ConfigLoadError;
+pub use codex_config::ConfigRequirements;
+pub use codex_config::ConfigRequirementsToml;
+pub use codex_config::ConstrainedWithSource;
+pub use codex_config::FeatureRequirementsToml;
+pub use codex_config::LoaderOverrides;
+pub use codex_config::McpServerIdentity;
+pub use codex_config::McpServerRequirement;
+pub use codex_config::NetworkConstraints;
+pub use codex_config::NetworkDomainPermissionToml;
+pub use codex_config::NetworkDomainPermissionsToml;
+pub use codex_config::NetworkRequirementsToml;
+pub use codex_config::NetworkUnixSocketPermissionToml;
+pub use codex_config::NetworkUnixSocketPermissionsToml;
+pub use codex_config::RequirementSource;
+pub use codex_config::ResidencyRequirement;
+pub use codex_config::SandboxModeRequirement;
+pub use codex_config::Sourced;
+pub use codex_config::TextPosition;
+pub use codex_config::TextRange;
+pub use codex_config::WebSearchModeRequirement;
+pub(crate) use codex_config::build_cli_overrides_layer;
+pub(crate) use codex_config::config_error_from_toml;
+pub use codex_config::default_project_root_markers;
+pub use codex_config::format_config_error;
+pub use codex_config::format_config_error_with_source;
+pub(crate) use codex_config::io_error_from_config_error;
+pub use codex_config::merge_toml_values;
+pub use codex_config::project_root_markers_from_config;
+#[cfg(test)]
+pub(crate) use codex_config::version_for_toml;
 
 /// On Unix systems, load default settings from this file path, if present.
 /// Note that /etc/codex/ is treated as a "config folder," so subfolders such
 /// as skills/ and rules/ will also be honored.
 pub const SYSTEM_CONFIG_TOML_FILE_UNIX: &str = "/etc/codex/config.toml";
 
-const DEFAULT_PROJECT_ROOT_MARKERS: &[&str] = &[".git"];
+#[cfg(windows)]
+const DEFAULT_PROGRAM_DATA_DIR_WINDOWS: &str = r"C:\ProgramData";
+
+pub(crate) async fn first_layer_config_error(layers: &ConfigLayerStack) -> Option<ConfigError> {
+    codex_config::first_layer_config_error::<ConfigToml>(layers, CONFIG_TOML_FILE).await
+}
+
+pub(crate) async fn first_layer_config_error_from_entries(
+    layers: &[ConfigLayerEntry],
+) -> Option<ConfigError> {
+    codex_config::first_layer_config_error_from_entries::<ConfigToml>(layers, CONFIG_TOML_FILE)
+        .await
+}
 
 /// To build up the set of admin-enforced constraints, we build up from multiple
 /// configuration layers in the following order, but a constraint defined in an
@@ -77,16 +90,17 @@ const DEFAULT_PROJECT_ROOT_MARKERS: &[&str] = &[".git"];
 ///
 /// - cloud:    managed cloud requirements
 /// - admin:    managed preferences (*)
-/// - system    `/etc/codex/requirements.toml`
+/// - system    `/etc/codex/requirements.toml` (Unix) or
+///   `%ProgramData%\OpenAI\Codex\requirements.toml` (Windows)
 ///
 /// For backwards compatibility, we also load from
-/// `/etc/codex/managed_config.toml` and map it to
-/// `/etc/codex/requirements.toml`.
+/// `managed_config.toml` and map it to `requirements.toml`.
 ///
 /// Configuration is built up from multiple layers in the following order:
 ///
 /// - admin:    managed preferences (*)
-/// - system    `/etc/codex/config.toml`
+/// - system    `/etc/codex/config.toml` (Unix) or
+///   `%ProgramData%\OpenAI\Codex\config.toml` (Windows)
 /// - user      `${CODEX_HOME}/config.toml`
 /// - cwd       `${PWD}/config.toml` (loaded but disabled when the directory is untrusted)
 /// - tree      parent directories up to root looking for `./.codex/config.toml` (loaded but disabled when untrusted)
@@ -110,7 +124,7 @@ pub async fn load_config_layers_state(
 ) -> io::Result<ConfigLayerStack> {
     let mut config_requirements_toml = ConfigRequirementsWithSources::default();
 
-    if let Some(requirements) = cloud_requirements.get().await {
+    if let Some(requirements) = cloud_requirements.get().await.map_err(io::Error::other)? {
         config_requirements_toml
             .merge_unset_fields(RequirementSource::CloudRequirements, requirements);
     }
@@ -124,14 +138,9 @@ pub async fn load_config_layers_state(
     )
     .await?;
 
-    // Honor /etc/codex/requirements.toml.
-    if cfg!(unix) {
-        load_requirements_toml(
-            &mut config_requirements_toml,
-            DEFAULT_REQUIREMENTS_TOML_FILE_UNIX,
-        )
-        .await?;
-    }
+    // Honor the system requirements.toml location.
+    let requirements_toml_file = system_requirements_toml_file()?;
+    load_requirements_toml(&mut config_requirements_toml, requirements_toml_file).await?;
 
     // Make a best-effort to support the legacy `managed_config.toml` as a
     // requirements specification.
@@ -147,7 +156,7 @@ pub async fn load_config_layers_state(
     let cli_overrides_layer = if cli_overrides.is_empty() {
         None
     } else {
-        let cli_overrides_layer = overrides::build_cli_overrides_layer(cli_overrides);
+        let cli_overrides_layer = build_cli_overrides_layer(cli_overrides);
         let base_dir = cwd
             .as_ref()
             .map(AbsolutePathBuf::as_path)
@@ -160,27 +169,18 @@ pub async fn load_config_layers_state(
 
     // Include an entry for the "system" config folder, loading its config.toml,
     // if it exists.
-    let system_config_toml_file = if cfg!(unix) {
-        Some(AbsolutePathBuf::from_absolute_path(
-            SYSTEM_CONFIG_TOML_FILE_UNIX,
-        )?)
-    } else {
-        // TODO(gt): Determine the path to load on Windows.
-        None
-    };
-    if let Some(system_config_toml_file) = system_config_toml_file {
-        let system_layer =
-            load_config_toml_for_required_layer(&system_config_toml_file, |config_toml| {
-                ConfigLayerEntry::new(
-                    ConfigLayerSource::System {
-                        file: system_config_toml_file.clone(),
-                    },
-                    config_toml,
-                )
-            })
-            .await?;
-        layers.push(system_layer);
-    }
+    let system_config_toml_file = system_config_toml_file()?;
+    let system_layer =
+        load_config_toml_for_required_layer(&system_config_toml_file, |config_toml| {
+            ConfigLayerEntry::new(
+                ConfigLayerSource::System {
+                    file: system_config_toml_file.clone(),
+                },
+                config_toml,
+            )
+        })
+        .await?;
+    layers.push(system_layer);
 
     // Add a layer for $CODEX_HOME/config.toml if it exists. Note if the file
     // exists, but is malformed, then this error should be propagated to the
@@ -213,7 +213,7 @@ pub async fn load_config_layers_state(
                     return Err(io_error_from_config_error(
                         io::ErrorKind::InvalidData,
                         config_error,
-                        None,
+                        /*source*/ None,
                     ));
                 }
                 return Err(err);
@@ -289,9 +289,17 @@ pub async fn load_config_layers_state(
         ));
     }
     if let Some(config) = managed_config_from_mdm {
-        layers.push(ConfigLayerEntry::new(
+        // As a general rule, config from MDM should _not_ include relative
+        // paths, starting with `./`, but a path starting with `~/` _is_ a
+        // supported use case. Because resolve_relative_paths_in_config_toml()
+        // relies on AbsolutePathBufGuard to resolve `~/`, we must supply a
+        // value for base_dir, so codex_home is as good a value as any.
+        let managed_config =
+            resolve_relative_paths_in_config_toml(config.managed_config, codex_home)?;
+        layers.push(ConfigLayerEntry::new_with_raw_toml(
             ConfigLayerSource::LegacyManagedConfigTomlFromMdm,
-            config,
+            managed_config,
+            config.raw_toml,
         ));
     }
 
@@ -346,8 +354,9 @@ async fn load_config_toml_for_required_layer(
     Ok(create_entry(toml_value))
 }
 
-/// If available, apply requirements from `/etc/codex/requirements.toml` to
-/// `config_requirements_toml` by filling in any unset fields.
+/// If available, apply requirements from the platform system
+/// `requirements.toml` location to `config_requirements_toml` by filling in
+/// any unset fields.
 async fn load_requirements_toml(
     config_requirements_toml: &mut ConfigRequirementsWithSources,
     requirements_toml_file: impl AsRef<Path>,
@@ -389,6 +398,99 @@ async fn load_requirements_toml(
     Ok(())
 }
 
+#[cfg(unix)]
+fn system_requirements_toml_file() -> io::Result<AbsolutePathBuf> {
+    AbsolutePathBuf::from_absolute_path(Path::new("/etc/codex/requirements.toml"))
+}
+
+#[cfg(windows)]
+fn system_requirements_toml_file() -> io::Result<AbsolutePathBuf> {
+    windows_system_requirements_toml_file()
+}
+
+#[cfg(unix)]
+fn system_config_toml_file() -> io::Result<AbsolutePathBuf> {
+    AbsolutePathBuf::from_absolute_path(Path::new(SYSTEM_CONFIG_TOML_FILE_UNIX))
+}
+
+#[cfg(windows)]
+fn system_config_toml_file() -> io::Result<AbsolutePathBuf> {
+    windows_system_config_toml_file()
+}
+
+#[cfg(windows)]
+fn windows_codex_system_dir() -> PathBuf {
+    let program_data = windows_program_data_dir_from_known_folder().unwrap_or_else(|err| {
+        tracing::warn!(
+            error = %err,
+            "Failed to resolve ProgramData known folder; using default path"
+        );
+        PathBuf::from(DEFAULT_PROGRAM_DATA_DIR_WINDOWS)
+    });
+    program_data.join("OpenAI").join("Codex")
+}
+
+#[cfg(windows)]
+fn windows_system_requirements_toml_file() -> io::Result<AbsolutePathBuf> {
+    let requirements_toml_file = windows_codex_system_dir().join("requirements.toml");
+    AbsolutePathBuf::try_from(requirements_toml_file)
+}
+
+#[cfg(windows)]
+fn windows_system_config_toml_file() -> io::Result<AbsolutePathBuf> {
+    let config_toml_file = windows_codex_system_dir().join("config.toml");
+    AbsolutePathBuf::try_from(config_toml_file)
+}
+
+#[cfg(windows)]
+fn windows_program_data_dir_from_known_folder() -> io::Result<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::FOLDERID_ProgramData;
+    use windows_sys::Win32::UI::Shell::KF_FLAG_DEFAULT;
+    use windows_sys::Win32::UI::Shell::SHGetKnownFolderPath;
+
+    let mut path_ptr = std::ptr::null_mut::<u16>();
+    let known_folder_flags = u32::try_from(KF_FLAG_DEFAULT).map_err(|_| {
+        io::Error::other(format!(
+            "KF_FLAG_DEFAULT did not fit in u32: {KF_FLAG_DEFAULT}"
+        ))
+    })?;
+    // Known folder IDs reference:
+    // https://learn.microsoft.com/en-us/windows/win32/shell/knownfolderid
+    // SAFETY: SHGetKnownFolderPath initializes path_ptr with a CoTaskMem-allocated,
+    // null-terminated UTF-16 string on success.
+    let hr = unsafe {
+        SHGetKnownFolderPath(&FOLDERID_ProgramData, known_folder_flags, 0, &mut path_ptr)
+    };
+    if hr != 0 {
+        return Err(io::Error::other(format!(
+            "SHGetKnownFolderPath(FOLDERID_ProgramData) failed with HRESULT {hr:#010x}"
+        )));
+    }
+    if path_ptr.is_null() {
+        return Err(io::Error::other(
+            "SHGetKnownFolderPath(FOLDERID_ProgramData) returned a null pointer",
+        ));
+    }
+
+    // SAFETY: path_ptr is a valid null-terminated UTF-16 string allocated by
+    // SHGetKnownFolderPath and must be freed with CoTaskMemFree.
+    let path = unsafe {
+        let mut len = 0usize;
+        while *path_ptr.add(len) != 0 {
+            len += 1;
+        }
+        let wide = std::slice::from_raw_parts(path_ptr, len);
+        let path = PathBuf::from(OsString::from_wide(wide));
+        CoTaskMemFree(path_ptr.cast());
+        path
+    };
+
+    Ok(path)
+}
+
 async fn load_requirements_from_legacy_scheme(
     config_requirements_toml: &mut ConfigRequirementsWithSources,
     loaded_config_layers: LoadedConfigLayers,
@@ -402,7 +504,12 @@ async fn load_requirements_from_legacy_scheme(
     } = loaded_config_layers;
 
     for (source, config) in managed_config_from_mdm
-        .map(|config| (RequirementSource::LegacyManagedConfigTomlFromMdm, config))
+        .map(|config| {
+            (
+                RequirementSource::LegacyManagedConfigTomlFromMdm,
+                config.managed_config,
+            )
+        })
         .into_iter()
         .chain(managed_config.map(|c| {
             (
@@ -426,61 +533,17 @@ async fn load_requirements_from_legacy_scheme(
     Ok(())
 }
 
-/// Reads `project_root_markers` from the [toml::Value] produced by merging
-/// `config.toml` from the config layers in the stack preceding
-/// [ConfigLayerSource::Project].
-///
-/// Invariants:
-/// - If `project_root_markers` is not specified, returns `Ok(None)`.
-/// - If `project_root_markers` is specified, returns `Ok(Some(markers))` where
-///   `markers` is a `Vec<String>` (including `Ok(Some(Vec::new()))` for an
-///   empty array, which indicates that root detection should be disabled).
-/// - Returns an error if `project_root_markers` is specified but is not an
-///   array of strings.
-pub(crate) fn project_root_markers_from_config(
-    config: &TomlValue,
-) -> io::Result<Option<Vec<String>>> {
-    let Some(table) = config.as_table() else {
-        return Ok(None);
-    };
-    let Some(markers_value) = table.get("project_root_markers") else {
-        return Ok(None);
-    };
-    let TomlValue::Array(entries) = markers_value else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "project_root_markers must be an array of strings",
-        ));
-    };
-    if entries.is_empty() {
-        return Ok(Some(Vec::new()));
-    }
-    let mut markers = Vec::new();
-    for entry in entries {
-        let Some(marker) = entry.as_str() else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "project_root_markers must be an array of strings",
-            ));
-        };
-        markers.push(marker.to_string());
-    }
-    Ok(Some(markers))
-}
-
-pub(crate) fn default_project_root_markers() -> Vec<String> {
-    DEFAULT_PROJECT_ROOT_MARKERS
-        .iter()
-        .map(ToString::to_string)
-        .collect()
-}
-
 struct ProjectTrustContext {
     project_root: AbsolutePathBuf,
     project_root_key: String,
     repo_root_key: Option<String>,
     projects_trust: std::collections::HashMap<String, TrustLevel>,
     user_config_file: AbsolutePathBuf,
+}
+
+#[derive(Deserialize)]
+struct ProjectTrustConfigToml {
+    projects: Option<std::collections::HashMap<String, crate::config::ProjectConfig>>,
 }
 
 struct ProjectTrustDecision {
@@ -496,7 +559,7 @@ impl ProjectTrustDecision {
 
 impl ProjectTrustContext {
     fn decision_for_dir(&self, dir: &AbsolutePathBuf) -> ProjectTrustDecision {
-        let dir_key = dir.as_path().to_string_lossy().to_string();
+        let dir_key = project_trust_key(dir.as_path());
         if let Some(trust_level) = self.projects_trust.get(&dir_key).copied() {
             return ProjectTrustDecision {
                 trust_level: Some(trust_level),
@@ -573,20 +636,28 @@ async fn project_trust_context(
     config_base_dir: &Path,
     user_config_file: &AbsolutePathBuf,
 ) -> io::Result<ProjectTrustContext> {
-    let config_toml = deserialize_config_toml_with_base(merged_config.clone(), config_base_dir)?;
+    let project_trust_config: ProjectTrustConfigToml = {
+        let _guard = AbsolutePathBufGuard::new(config_base_dir);
+        merged_config
+            .clone()
+            .try_into()
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?
+    };
 
     let project_root = find_project_root(cwd, project_root_markers).await?;
-    let projects = config_toml.projects.unwrap_or_default();
+    let projects = project_trust_config.projects.unwrap_or_default();
 
-    let project_root_key = project_root.as_path().to_string_lossy().to_string();
+    let project_root_key = project_trust_key(project_root.as_path());
     let repo_root = resolve_root_git_project_for_trust(cwd.as_path());
-    let repo_root_key = repo_root
-        .as_ref()
-        .map(|root| root.to_string_lossy().to_string());
+    let repo_root_key = repo_root.as_ref().map(|root| project_trust_key(root));
 
     let projects_trust = projects
         .into_iter()
-        .filter_map(|(key, project)| project.trust_level.map(|trust_level| (key, trust_level)))
+        .filter_map(|(key, project)| {
+            project
+                .trust_level
+                .map(|trust_level| (project_trust_key(Path::new(&key)), trust_level))
+        })
         .collect();
 
     Ok(ProjectTrustContext {
@@ -598,13 +669,23 @@ async fn project_trust_context(
     })
 }
 
+/// Canonicalize the path and convert it to a string to be used as a key in the
+/// projects trust map. On Windows, strips UNC, when possible, to try to ensure
+/// that different paths that point to the same location have the same key.
+pub fn project_trust_key(project_path: &Path) -> String {
+    normalize_path(project_path)
+        .unwrap_or_else(|_| project_path.to_path_buf())
+        .to_string_lossy()
+        .to_string()
+}
+
 /// Takes a `toml::Value` parsed from a config.toml file and walks through it,
 /// resolving any `AbsolutePathBuf` fields against `base_dir`, returning a new
 /// `toml::Value` with the same shape but with paths resolved.
 ///
 /// This ensures that multiple config layers can be merged together correctly
 /// even if they were loaded from different directories.
-fn resolve_relative_paths_in_config_toml(
+pub(crate) fn resolve_relative_paths_in_config_toml(
     value_from_config_toml: TomlValue,
     base_dir: &Path,
 ) -> io::Result<TomlValue> {
@@ -746,15 +827,20 @@ async fn load_project_layers(
                             &dot_codex_abs,
                             &layer_dir,
                             TomlValue::Table(toml::map::Map::new()),
-                            true,
+                            /*config_toml_exists*/ true,
                         ));
                         continue;
                     }
                 };
                 let config =
                     resolve_relative_paths_in_config_toml(config, dot_codex_abs.as_path())?;
-                let entry =
-                    project_layer_entry(trust_context, &dot_codex_abs, &layer_dir, config, true);
+                let entry = project_layer_entry(
+                    trust_context,
+                    &dot_codex_abs,
+                    &layer_dir,
+                    config,
+                    /*config_toml_exists*/ true,
+                );
                 layers.push(entry);
             }
             Err(err) => {
@@ -767,7 +853,7 @@ async fn load_project_layers(
                         &dot_codex_abs,
                         &layer_dir,
                         TomlValue::Table(toml::map::Map::new()),
-                        false,
+                        /*config_toml_exists*/ false,
                     ));
                 } else {
                     let config_file_display = config_file.as_path().display();
@@ -826,6 +912,8 @@ impl From<LegacyManagedConfigToml> for ConfigRequirementsToml {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    #[cfg(windows)]
+    use std::path::Path;
     use tempfile::tempdir;
 
     #[test]
@@ -880,6 +968,50 @@ foo = "xyzzy"
                 SandboxModeRequirement::ReadOnly,
                 SandboxModeRequirement::WorkspaceWrite
             ])
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_system_requirements_toml_file_uses_expected_suffix() {
+        let expected = windows_program_data_dir_from_known_folder()
+            .unwrap_or_else(|_| PathBuf::from(DEFAULT_PROGRAM_DATA_DIR_WINDOWS))
+            .join("OpenAI")
+            .join("Codex")
+            .join("requirements.toml");
+        assert_eq!(
+            windows_system_requirements_toml_file()
+                .expect("requirements.toml path")
+                .as_path(),
+            expected.as_path()
+        );
+        assert!(
+            windows_system_requirements_toml_file()
+                .expect("requirements.toml path")
+                .as_path()
+                .ends_with(Path::new("OpenAI").join("Codex").join("requirements.toml"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_system_config_toml_file_uses_expected_suffix() {
+        let expected = windows_program_data_dir_from_known_folder()
+            .unwrap_or_else(|_| PathBuf::from(DEFAULT_PROGRAM_DATA_DIR_WINDOWS))
+            .join("OpenAI")
+            .join("Codex")
+            .join("config.toml");
+        assert_eq!(
+            windows_system_config_toml_file()
+                .expect("config.toml path")
+                .as_path(),
+            expected.as_path()
+        );
+        assert!(
+            windows_system_config_toml_file()
+                .expect("config.toml path")
+                .as_path()
+                .ends_with(Path::new("OpenAI").join("Codex").join("config.toml"))
         );
     }
 }

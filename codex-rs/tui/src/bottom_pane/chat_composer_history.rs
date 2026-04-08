@@ -5,7 +5,7 @@ use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::MentionBinding;
 use crate::mention_codec::decode_history_mentions;
-use codex_core::protocol::Op;
+use codex_protocol::protocol::Op;
 use codex_protocol::user_input::TextElement;
 
 /// A composer history entry that can rehydrate draft state.
@@ -17,6 +17,8 @@ pub(crate) struct HistoryEntry {
     pub(crate) text_elements: Vec<TextElement>,
     /// Local image paths captured alongside `text_elements`.
     pub(crate) local_image_paths: Vec<PathBuf>,
+    /// Remote image URLs restored with this draft.
+    pub(crate) remote_image_urls: Vec<String>,
     /// Mention bindings for tool/app/skill references inside `text`.
     pub(crate) mention_bindings: Vec<MentionBinding>,
     /// Placeholder-to-payload pairs used to restore large paste content.
@@ -30,6 +32,7 @@ impl HistoryEntry {
             text: decoded.text,
             text_elements: Vec::new(),
             local_image_paths: Vec::new(),
+            remote_image_urls: Vec::new(),
             mention_bindings: decoded
                 .mentions
                 .into_iter()
@@ -53,6 +56,25 @@ impl HistoryEntry {
             text,
             text_elements,
             local_image_paths,
+            remote_image_urls: Vec::new(),
+            mention_bindings: Vec::new(),
+            pending_pastes,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_pending_and_remote(
+        text: String,
+        text_elements: Vec<TextElement>,
+        local_image_paths: Vec<PathBuf>,
+        pending_pastes: Vec<(String, String)>,
+        remote_image_urls: Vec<String>,
+    ) -> Self {
+        Self {
+            text,
+            text_elements,
+            local_image_paths,
+            remote_image_urls,
             mention_bindings: Vec::new(),
             pending_pastes,
         }
@@ -70,7 +92,7 @@ pub(crate) struct ChatComposerHistory {
     history_entry_count: usize,
 
     /// Messages submitted by the user *during this UI session* (newest at END).
-    /// Local entries retain full draft state (text elements, image paths, pending pastes).
+    /// Local entries retain full draft state (text elements, image paths, pending pastes, remote image URLs).
     local_history: Vec<HistoryEntry>,
 
     /// Cache of persistent history entries fetched on-demand (text-only).
@@ -82,7 +104,8 @@ pub(crate) struct ChatComposerHistory {
 
     /// The text that was last inserted into the composer as a result of
     /// history navigation. Used to decide if further Up/Down presses should be
-    /// treated as navigation versus normal cursor movement.
+    /// treated as navigation versus normal cursor movement, together with the
+    /// "cursor at line boundary" check in [`Self::should_handle_navigation`].
     last_history_text: Option<String>,
 }
 
@@ -114,6 +137,7 @@ impl ChatComposerHistory {
         if entry.text.is_empty()
             && entry.text_elements.is_empty()
             && entry.local_image_paths.is_empty()
+            && entry.remote_image_urls.is_empty()
             && entry.mention_bindings.is_empty()
             && entry.pending_pastes.is_empty()
         {
@@ -136,8 +160,16 @@ impl ChatComposerHistory {
         self.last_history_text = None;
     }
 
-    /// Should Up/Down key presses be interpreted as history navigation given
-    /// the current content and cursor position of `textarea`?
+    /// Returns whether Up/Down should navigate history for the current textarea state.
+    ///
+    /// Empty text always enables history traversal. For non-empty text, this requires both:
+    ///
+    /// - the current text exactly matching the last recalled history entry, and
+    /// - the cursor being at a line boundary (start or end).
+    ///
+    /// This boundary gate keeps multiline cursor movement usable while preserving shell-like
+    /// history recall. If callers moved the cursor into the middle of a recalled entry and still
+    /// forced navigation, users would lose normal vertical movement within the draft.
     pub fn should_handle_navigation(&self, text: &str, cursor: usize) -> bool {
         if self.history_entry_count == 0 && self.local_history.is_empty() {
             return false;
@@ -147,10 +179,11 @@ impl ChatComposerHistory {
             return true;
         }
 
-        // Textarea is not empty – only navigate when cursor is at start and
-        // text matches last recalled history entry so regular editing is not
-        // hijacked.
-        if cursor != 0 {
+        // Textarea is not empty – only navigate when text matches the last
+        // recalled history entry and the cursor is at a line boundary. This
+        // keeps shell-like Up/Down recall working while still allowing normal
+        // multiline cursor movement from interior positions.
+        if cursor != 0 && cursor != text.len() {
             return false;
         }
 
@@ -245,11 +278,10 @@ impl ChatComposerHistory {
             self.last_history_text = Some(entry.text.clone());
             return Some(entry);
         } else if let Some(log_id) = self.history_log_id {
-            let op = Op::GetHistoryEntryRequest {
+            app_event_tx.send(AppEvent::CodexOp(Op::GetHistoryEntryRequest {
                 offset: global_idx,
                 log_id,
-            };
-            app_event_tx.send(AppEvent::CodexOp(op));
+            }));
         }
         None
     }
@@ -259,7 +291,6 @@ impl ChatComposerHistory {
 mod tests {
     use super::*;
     use crate::app_event::AppEvent;
-    use codex_core::protocol::Op;
     use pretty_assertions::assert_eq;
     use tokio::sync::mpsc::unbounded_channel;
 
@@ -299,50 +330,50 @@ mod tests {
 
         let mut history = ChatComposerHistory::new();
         // Pretend there are 3 persistent entries.
-        history.set_metadata(1, 3);
+        history.set_metadata(/*log_id*/ 1, /*entry_count*/ 3);
 
         // First Up should request offset 2 (latest) and await async data.
-        assert!(history.should_handle_navigation("", 0));
+        assert!(history.should_handle_navigation("", /*cursor*/ 0));
         assert!(history.navigate_up(&tx).is_none()); // don't replace the text yet
 
-        // Verify that an AppEvent::CodexOp with the correct GetHistoryEntryRequest was sent.
+        // Verify that a history lookup request was sent.
         let event = rx.try_recv().expect("expected AppEvent to be sent");
-        let AppEvent::CodexOp(history_request1) = event else {
+        let AppEvent::CodexOp(op) = event else {
             panic!("unexpected event variant");
         };
         assert_eq!(
             Op::GetHistoryEntryRequest {
                 log_id: 1,
-                offset: 2
+                offset: 2,
             },
-            history_request1
+            op
         );
 
         // Inject the async response.
         assert_eq!(
             Some(HistoryEntry::new("latest".to_string())),
-            history.on_entry_response(1, 2, Some("latest".into()))
+            history.on_entry_response(/*log_id*/ 1, /*offset*/ 2, Some("latest".into()))
         );
 
         // Next Up should move to offset 1.
         assert!(history.navigate_up(&tx).is_none()); // don't replace the text yet
 
-        // Verify second CodexOp event for offset 1.
+        // Verify second lookup request for offset 1.
         let event2 = rx.try_recv().expect("expected second event");
-        let AppEvent::CodexOp(history_request_2) = event2 else {
+        let AppEvent::CodexOp(op) = event2 else {
             panic!("unexpected event variant");
         };
         assert_eq!(
             Op::GetHistoryEntryRequest {
                 log_id: 1,
-                offset: 1
+                offset: 1,
             },
-            history_request_2
+            op
         );
 
         assert_eq!(
             Some(HistoryEntry::new("older".to_string())),
-            history.on_entry_response(1, 1, Some("older".into()))
+            history.on_entry_response(/*log_id*/ 1, /*offset*/ 1, Some("older".into()))
         );
     }
 
@@ -352,7 +383,7 @@ mod tests {
         let tx = AppEventSender::new(tx);
 
         let mut history = ChatComposerHistory::new();
-        history.set_metadata(1, 3);
+        history.set_metadata(/*log_id*/ 1, /*entry_count*/ 3);
         history
             .fetched_history
             .insert(1, HistoryEntry::new("command2".to_string()));
@@ -377,5 +408,17 @@ mod tests {
             Some(HistoryEntry::new("command3".to_string())),
             history.navigate_up(&tx)
         );
+    }
+
+    #[test]
+    fn should_handle_navigation_when_cursor_is_at_line_boundaries() {
+        let mut history = ChatComposerHistory::new();
+        history.record_local_submission(HistoryEntry::new("hello".to_string()));
+        history.last_history_text = Some("hello".to_string());
+
+        assert!(history.should_handle_navigation("hello", /*cursor*/ 0));
+        assert!(history.should_handle_navigation("hello", "hello".len()));
+        assert!(!history.should_handle_navigation("hello", /*cursor*/ 1));
+        assert!(!history.should_handle_navigation("other", /*cursor*/ 0));
     }
 }

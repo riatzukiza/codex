@@ -10,11 +10,12 @@ use futures::FutureExt as _;
 use rmcp::model::AnnotateAble;
 use rmcp::model::ClientCapabilities;
 use rmcp::model::ElicitationCapability;
+use rmcp::model::FormElicitationCapability;
 use rmcp::model::Implementation;
-use rmcp::model::InitializeRequestParam;
+use rmcp::model::InitializeRequestParams;
 use rmcp::model::ListResourceTemplatesResult;
 use rmcp::model::ProtocolVersion;
-use rmcp::model::ReadResourceRequestParam;
+use rmcp::model::ReadResourceRequestParams;
 use rmcp::model::ResourceContents;
 use serde_json::json;
 
@@ -24,20 +25,27 @@ fn stdio_server_bin() -> Result<PathBuf, CargoBinError> {
     codex_utils_cargo_bin::cargo_bin("test_stdio_server")
 }
 
-fn init_params() -> InitializeRequestParam {
-    InitializeRequestParam {
+fn init_params() -> InitializeRequestParams {
+    InitializeRequestParams {
+        meta: None,
         capabilities: ClientCapabilities {
             experimental: None,
+            extensions: None,
             roots: None,
             sampling: None,
             elicitation: Some(ElicitationCapability {
-                schema_validation: None,
+                form: Some(FormElicitationCapability {
+                    schema_validation: None,
+                }),
+                url: None,
             }),
+            tasks: None,
         },
         client_info: Implementation {
             name: "codex-test".into(),
             version: "0.0.0-test".into(),
             title: Some("Codex rmcp resource test".into()),
+            description: None,
             icons: None,
             website_url: None,
         },
@@ -50,9 +58,9 @@ async fn rmcp_client_can_list_and_read_resources() -> anyhow::Result<()> {
     let client = RmcpClient::new_stdio_client(
         stdio_server_bin()?.into(),
         Vec::<OsString>::new(),
-        None,
+        /*env*/ None,
         &[],
-        None,
+        /*cwd*/ None,
     )
     .await?;
 
@@ -65,6 +73,7 @@ async fn rmcp_client_can_list_and_read_resources() -> anyhow::Result<()> {
                     Ok(ElicitationResponse {
                         action: ElicitationAction::Accept,
                         content: Some(json!({})),
+                        meta: None,
                     })
                 }
                 .boxed()
@@ -73,7 +82,7 @@ async fn rmcp_client_can_list_and_read_resources() -> anyhow::Result<()> {
         .await?;
 
     let list = client
-        .list_resources(None, Some(Duration::from_secs(5)))
+        .list_resources(/*params*/ None, Some(Duration::from_secs(5)))
         .await?;
     let memo = list
         .resources
@@ -95,7 +104,7 @@ async fn rmcp_client_can_list_and_read_resources() -> anyhow::Result<()> {
         .no_annotation()
     );
     let templates = client
-        .list_resource_templates(None, Some(Duration::from_secs(5)))
+        .list_resource_templates(/*params*/ None, Some(Duration::from_secs(5)))
         .await?;
     assert_eq!(
         templates,
@@ -111,6 +120,7 @@ async fn rmcp_client_can_list_and_read_resources() -> anyhow::Result<()> {
                         "Template for memo://codex/{slug} resources used in tests.".to_string(),
                     ),
                     mime_type: Some("text/plain".to_string()),
+                    icons: None,
                 }
                 .no_annotation()
             ],
@@ -119,7 +129,8 @@ async fn rmcp_client_can_list_and_read_resources() -> anyhow::Result<()> {
 
     let read = client
         .read_resource(
-            ReadResourceRequestParam {
+            ReadResourceRequestParams {
+                meta: None,
                 uri: RESOURCE_URI.to_string(),
             },
             Some(Duration::from_secs(5)),

@@ -1,8 +1,10 @@
 use super::LoaderOverrides;
-use super::diagnostics::config_error_from_toml;
-use super::diagnostics::io_error_from_config_error;
+#[cfg(target_os = "macos")]
+use super::macos::ManagedAdminConfigLayer;
 #[cfg(target_os = "macos")]
 use super::macos::load_managed_admin_config_layer;
+use codex_config::config_error_from_toml;
+use codex_config::io_error_from_config_error;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::io;
 use std::path::Path;
@@ -20,11 +22,17 @@ pub(super) struct MangedConfigFromFile {
 }
 
 #[derive(Debug, Clone)]
+pub(super) struct ManagedConfigFromMdm {
+    pub managed_config: TomlValue,
+    pub raw_toml: String,
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct LoadedConfigLayers {
     /// If present, data read from a file such as `/etc/codex/managed_config.toml`.
     pub managed_config: Option<MangedConfigFromFile>,
     /// If present, data read from managed preferences (macOS only).
-    pub managed_config_from_mdm: Option<TomlValue>,
+    pub managed_config_from_mdm: Option<ManagedConfigFromMdm>,
 }
 
 pub(super) async fn load_config_layers_internal(
@@ -48,16 +56,19 @@ pub(super) async fn load_config_layers_internal(
         managed_config_path.unwrap_or_else(|| managed_config_default_path(codex_home)),
     )?;
 
-    let managed_config = read_config_from_path(&managed_config_path, false)
-        .await?
-        .map(|managed_config| MangedConfigFromFile {
-            managed_config,
-            file: managed_config_path.clone(),
-        });
+    let managed_config =
+        read_config_from_path(&managed_config_path, /*log_missing_as_info*/ false)
+            .await?
+            .map(|managed_config| MangedConfigFromFile {
+                managed_config,
+                file: managed_config_path.clone(),
+            });
 
     #[cfg(target_os = "macos")]
     let managed_preferences =
-        load_managed_admin_config_layer(managed_preferences_base64.as_deref()).await?;
+        load_managed_admin_config_layer(managed_preferences_base64.as_deref())
+            .await?
+            .map(map_managed_admin_layer);
 
     #[cfg(not(target_os = "macos"))]
     let managed_preferences = None;
@@ -66,6 +77,15 @@ pub(super) async fn load_config_layers_internal(
         managed_config,
         managed_config_from_mdm: managed_preferences,
     })
+}
+
+#[cfg(target_os = "macos")]
+fn map_managed_admin_layer(layer: ManagedAdminConfigLayer) -> ManagedConfigFromMdm {
+    let ManagedAdminConfigLayer { config, raw_toml } = layer;
+    ManagedConfigFromMdm {
+        managed_config: config,
+        raw_toml,
+    }
 }
 
 pub(super) async fn read_config_from_path(

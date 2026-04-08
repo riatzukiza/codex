@@ -2,7 +2,7 @@ use clap::Args;
 use clap::FromArgMatches;
 use clap::Parser;
 use clap::ValueEnum;
-use codex_common::CliConfigOverrides;
+use codex_utils_cli::CliConfigOverrides;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -38,7 +38,7 @@ pub struct Cli {
     /// Select the sandbox policy to use when executing model-generated shell
     /// commands.
     #[arg(long = "sandbox", short = 's', value_enum)]
-    pub sandbox_mode: Option<codex_common::SandboxModeCliArg>,
+    pub sandbox_mode: Option<codex_utils_cli::SandboxModeCliArg>,
 
     /// Configuration profile from config.toml to specify default options.
     #[arg(long = "profile", short = 'p')]
@@ -96,11 +96,17 @@ pub struct Cli {
     pub json: bool,
 
     /// Specifies file where the last message from the agent should be written.
-    #[arg(long = "output-last-message", short = 'o', value_name = "FILE")]
+    #[arg(
+        long = "output-last-message",
+        short = 'o',
+        value_name = "FILE",
+        global = true
+    )]
     pub last_message_file: Option<PathBuf>,
 
     /// Initial instructions for the agent. If not provided as an argument (or
-    /// if `-` is used), instructions are read from stdin.
+    /// if `-` is used), instructions are read from stdin. If stdin is piped and
+    /// a prompt is also provided, stdin is appended as a `<stdin>` block.
     #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
     pub prompt: Option<String>,
 }
@@ -250,37 +256,5 @@ pub enum Color {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn resume_parses_prompt_after_global_flags() {
-        const PROMPT: &str = "echo resume-with-global-flags-after-subcommand";
-        let cli = Cli::parse_from([
-            "codex-exec",
-            "resume",
-            "--last",
-            "--json",
-            "--model",
-            "gpt-5.2-codex",
-            "--dangerously-bypass-approvals-and-sandbox",
-            "--skip-git-repo-check",
-            "--ephemeral",
-            PROMPT,
-        ]);
-
-        assert!(cli.ephemeral);
-        let Some(Command::Resume(args)) = cli.command else {
-            panic!("expected resume command");
-        };
-        let effective_prompt = args.prompt.clone().or_else(|| {
-            if args.last {
-                args.session_id.clone()
-            } else {
-                None
-            }
-        });
-        assert_eq!(effective_prompt.as_deref(), Some(PROMPT));
-    }
-}
+#[path = "cli_tests.rs"]
+mod tests;

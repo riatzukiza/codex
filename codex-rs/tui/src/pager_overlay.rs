@@ -409,8 +409,9 @@ struct CellRenderable {
 
 impl Renderable for CellRenderable {
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let p =
-            Paragraph::new(Text::from(self.cell.transcript_lines(area.width))).style(self.style);
+        let p = Paragraph::new(Text::from(self.cell.transcript_lines(area.width)))
+            .style(self.style)
+            .wrap(Wrap { trim: false });
         p.render(area, buf);
     }
 
@@ -456,7 +457,7 @@ impl TranscriptOverlay {
     pub(crate) fn new(transcript_cells: Vec<Arc<dyn HistoryCell>>) -> Self {
         Self {
             view: PagerView::new(
-                Self::render_cells(&transcript_cells, None),
+                Self::render_cells(&transcript_cells, /*highlight_cell*/ None),
                 "T R A N S C R I P T".to_string(),
                 usize::MAX,
             ),
@@ -494,7 +495,9 @@ impl TranscriptOverlay {
                 if !c.is_stream_continuation() && i > 0 {
                     cell_renderable = Box::new(InsetRenderable::new(
                         cell_renderable,
-                        Insets::tlbr(1, 0, 0, 0),
+                        Insets::tlbr(
+                            /*top*/ 1, /*left*/ 0, /*bottom*/ 0, /*right*/ 0,
+                        ),
                     ));
                 }
                 v.push(cell_renderable);
@@ -527,13 +530,37 @@ impl TranscriptOverlay {
             {
                 // The tail was rendered as the only entry, so it lacks a top
                 // inset; add one now that it follows a committed cell.
-                Box::new(InsetRenderable::new(tail, Insets::tlbr(1, 0, 0, 0)))
-                    as Box<dyn Renderable>
+                Box::new(InsetRenderable::new(
+                    tail,
+                    Insets::tlbr(
+                        /*top*/ 1, /*left*/ 0, /*bottom*/ 0, /*right*/ 0,
+                    ),
+                )) as Box<dyn Renderable>
             } else {
                 tail
             };
             self.view.renderables.push(tail);
         }
+        if follow_bottom {
+            self.view.scroll_offset = usize::MAX;
+        }
+    }
+
+    /// Replace committed transcript cells while keeping any cached in-progress output that is
+    /// currently shown at the end of the overlay.
+    ///
+    /// This is used when existing history is trimmed (for example after rollback) so the
+    /// transcript overlay immediately reflects the same committed cells as the main transcript.
+    pub(crate) fn replace_cells(&mut self, cells: Vec<Arc<dyn HistoryCell>>) {
+        let follow_bottom = self.view.is_scrolled_to_bottom();
+        self.cells = cells;
+        if self
+            .highlight_cell
+            .is_some_and(|idx| idx >= self.cells.len())
+        {
+            self.highlight_cell = None;
+        }
+        self.rebuild_renderables();
         if follow_bottom {
             self.view.scroll_offset = usize::MAX;
         }
@@ -625,10 +652,15 @@ impl TranscriptOverlay {
         has_prior_cells: bool,
         is_stream_continuation: bool,
     ) -> Box<dyn Renderable> {
-        let paragraph = Paragraph::new(Text::from(lines));
+        let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
         let mut renderable: Box<dyn Renderable> = Box::new(CachedRenderable::new(paragraph));
         if has_prior_cells && !is_stream_continuation {
-            renderable = Box::new(InsetRenderable::new(renderable, Insets::tlbr(1, 0, 0, 0)));
+            renderable = Box::new(InsetRenderable::new(
+                renderable,
+                Insets::tlbr(
+                    /*top*/ 1, /*left*/ 0, /*bottom*/ 0, /*right*/ 0,
+                ),
+            ));
         }
         renderable
     }
@@ -680,6 +712,11 @@ impl TranscriptOverlay {
     pub(crate) fn is_done(&self) -> bool {
         self.is_done
     }
+
+    #[cfg(test)]
+    pub(crate) fn committed_cell_count(&self) -> usize {
+        self.cells.len()
+    }
 }
 
 pub(crate) struct StaticOverlay {
@@ -695,7 +732,7 @@ impl StaticOverlay {
 
     pub(crate) fn with_renderables(renderables: Vec<Box<dyn Renderable>>, title: String) -> Self {
         Self {
-            view: PagerView::new(renderables, title, 0),
+            view: PagerView::new(renderables, title, /*scroll_offset*/ 0),
             is_done: false,
         }
     }
@@ -771,8 +808,8 @@ fn render_offset_content(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_core::protocol::ExecCommandSource;
-    use codex_core::protocol::ReviewDecision;
+    use codex_protocol::protocol::ExecCommandSource;
+    use codex_protocol::protocol::ReviewDecision;
     use insta::assert_snapshot;
     use pretty_assertions::assert_eq;
     use std::collections::HashMap;
@@ -784,8 +821,8 @@ mod tests {
     use crate::history_cell;
     use crate::history_cell::HistoryCell;
     use crate::history_cell::new_patch_event;
-    use codex_core::protocol::FileChange;
     use codex_protocol::parse_command::ParsedCommand;
+    use codex_protocol::protocol::FileChange;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::text::Text;
@@ -877,7 +914,7 @@ mod tests {
             lines: vec![Line::from("alpha")],
         })]);
         overlay.sync_live_tail(
-            40,
+            /*width*/ 40,
             Some(ActiveCellTranscriptKey {
                 revision: 1,
                 is_stream_continuation: false,
@@ -905,11 +942,11 @@ mod tests {
             animation_tick: None,
         };
 
-        overlay.sync_live_tail(40, Some(key), |_| {
+        overlay.sync_live_tail(/*width*/ 40, Some(key), |_| {
             calls.set(calls.get() + 1);
             Some(vec![Line::from("tail")])
         });
-        overlay.sync_live_tail(40, Some(key), |_| {
+        overlay.sync_live_tail(/*width*/ 40, Some(key), |_| {
             calls.set(calls.get() + 1);
             Some(vec![Line::from("tail2")])
         });
@@ -962,9 +999,12 @@ mod tests {
         let apply_begin_cell: Arc<dyn HistoryCell> = Arc::new(new_patch_event(apply_changes, &cwd));
         cells.push(apply_begin_cell);
 
-        let apply_end_cell: Arc<dyn HistoryCell> =
-            history_cell::new_approval_decision_cell(vec!["ls".into()], ReviewDecision::Approved)
-                .into();
+        let apply_end_cell: Arc<dyn HistoryCell> = history_cell::new_approval_decision_cell(
+            vec!["ls".into()],
+            ReviewDecision::Approved,
+            history_cell::ApprovalDecisionActor::User,
+        )
+        .into();
         cells.push(apply_end_cell);
 
         let mut exec_cell = crate::exec_cell::new_active_exec_command(
@@ -972,8 +1012,8 @@ mod tests {
             vec!["bash".into(), "-lc".into(), "ls".into()],
             vec![ParsedCommand::Unknown { cmd: "ls".into() }],
             ExecCommandSource::Agent,
-            None,
-            true,
+            /*interaction_input*/ None,
+            /*animations_enabled*/ true,
         );
         exec_cell.complete_call(
             "exec-1",
@@ -1172,30 +1212,33 @@ mod tests {
     #[test]
     fn pager_view_content_height_counts_renderables() {
         let pv = PagerView::new(
-            vec![paragraph_block("a", 2), paragraph_block("b", 3)],
+            vec![
+                paragraph_block("a", /*lines*/ 2),
+                paragraph_block("b", /*lines*/ 3),
+            ],
             "T".to_string(),
-            0,
+            /*scroll_offset*/ 0,
         );
 
-        assert_eq!(pv.content_height(80), 5);
+        assert_eq!(pv.content_height(/*width*/ 80), 5);
     }
 
     #[test]
     fn pager_view_ensure_chunk_visible_scrolls_down_when_needed() {
         let mut pv = PagerView::new(
             vec![
-                paragraph_block("a", 1),
-                paragraph_block("b", 3),
-                paragraph_block("c", 3),
+                paragraph_block("a", /*lines*/ 1),
+                paragraph_block("b", /*lines*/ 3),
+                paragraph_block("c", /*lines*/ 3),
             ],
             "T".to_string(),
-            0,
+            /*scroll_offset*/ 0,
         );
         let area = Rect::new(0, 0, 20, 8);
 
         pv.scroll_offset = 0;
         let content_area = pv.content_area(area);
-        pv.ensure_chunk_visible(2, content_area);
+        pv.ensure_chunk_visible(/*idx*/ 2, content_area);
 
         let mut buf = Buffer::empty(area);
         pv.render(area, &mut buf);
@@ -1219,24 +1262,28 @@ mod tests {
     fn pager_view_ensure_chunk_visible_scrolls_up_when_needed() {
         let mut pv = PagerView::new(
             vec![
-                paragraph_block("a", 2),
-                paragraph_block("b", 3),
-                paragraph_block("c", 3),
+                paragraph_block("a", /*lines*/ 2),
+                paragraph_block("b", /*lines*/ 3),
+                paragraph_block("c", /*lines*/ 3),
             ],
             "T".to_string(),
-            0,
+            /*scroll_offset*/ 0,
         );
         let area = Rect::new(0, 0, 20, 3);
 
         pv.scroll_offset = 6;
-        pv.ensure_chunk_visible(0, area);
+        pv.ensure_chunk_visible(/*idx*/ 0, area);
 
         assert_eq!(pv.scroll_offset, 0);
     }
 
     #[test]
     fn pager_view_is_scrolled_to_bottom_accounts_for_wrapped_height() {
-        let mut pv = PagerView::new(vec![paragraph_block("a", 10)], "T".to_string(), 0);
+        let mut pv = PagerView::new(
+            vec![paragraph_block("a", /*lines*/ 10)],
+            "T".to_string(),
+            /*scroll_offset*/ 0,
+        );
         let area = Rect::new(0, 0, 20, 8);
         let mut buf = Buffer::empty(area);
 

@@ -1,7 +1,7 @@
 use clap::Parser;
 use clap::ValueHint;
-use codex_common::ApprovalModeCliArg;
-use codex_common::CliConfigOverrides;
+use codex_utils_cli::ApprovalModeCliArg;
+use codex_utils_cli::CliConfigOverrides;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -31,6 +31,10 @@ pub struct Cli {
     /// Internal: show all sessions (disables cwd filtering and shows CWD column).
     #[clap(skip)]
     pub resume_show_all: bool,
+
+    /// Internal: include non-interactive sessions in resume listings.
+    #[clap(skip)]
+    pub resume_include_non_interactive: bool,
 
     // Internal controls set by the top-level `codex fork` subcommand.
     // These are not exposed as user flags on the base `codex` command.
@@ -70,7 +74,7 @@ pub struct Cli {
     /// Select the sandbox policy to use when executing model-generated shell
     /// commands.
     #[arg(long = "sandbox", short = 's')]
-    pub sandbox_mode: Option<codex_common::SandboxModeCliArg>,
+    pub sandbox_mode: Option<codex_utils_cli::SandboxModeCliArg>,
 
     /// Configure when the model requires human approval before executing a command.
     #[arg(long = "ask-for-approval", short = 'a')]
@@ -91,6 +95,7 @@ pub struct Cli {
     pub dangerously_bypass_approvals_and_sandbox: bool,
 
     /// Tell the agent to use the specified directory as its working root.
+    /// In remote mode, the path is forwarded to the server and resolved there.
     #[clap(long = "cd", short = 'C', value_name = "DIR")]
     pub cwd: Option<PathBuf>,
 

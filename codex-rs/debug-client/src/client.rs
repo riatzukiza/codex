@@ -1,3 +1,4 @@
+#![allow(clippy::expect_used)]
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Write;
@@ -102,6 +103,7 @@ impl AppServerClient {
                 },
                 capabilities: Some(InitializeCapabilities {
                     experimental_api: true,
+                    opt_out_notification_methods: None,
                 }),
             },
         };
@@ -179,6 +181,8 @@ impl AppServerClient {
                 model_providers: None,
                 source_kinds: None,
                 archived: None,
+                cwd: None,
+                search_term: None,
             },
         };
         self.send(&request)?;
